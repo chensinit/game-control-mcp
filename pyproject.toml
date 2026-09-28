@@ -1,0 +1,21 @@
+[project]
+name = "game-control-mcp"
+version = "0.1.0"
+description = "A local MCP server for controlling a selected Windows game window"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.0,<3",
+    "mss>=10.0,<11",
+    "Pillow>=11.0,<13",
+    "PyWinCtl>=0.4,<1",
+]
+
+[project.scripts]
+game-control-mcp = "game_control.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["game_control"]
