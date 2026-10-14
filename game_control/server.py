@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import ctypes
+import atexit
 import base64
 import io
+import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import mss
@@ -20,7 +24,10 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 SERVER = MCPServer(
     "game-control",
     instructions=(
-        "Control one user-selected Windows game window. Call list_windows and select_window first. "
+        "Control one Windows game window per MCP stdio connection. launch_game starts and selects "
+        "a game; stop_game terminates the selected app. Games started by launch_game are stopped "
+        "when this server connection exits. Call list_windows and select_window to control an "
+        "already-running game. "
         "Call get_screenshot before clicking or swiping: click, move_mouse, tap, and swipe coordinates "
         "are pixels in the most recently returned, resized screenshot, with (0, 0) at its top-left. "
         "click, press_key, press_keys, and type_text support input_mode='window_message' to post "
@@ -53,6 +60,7 @@ class GameController:
     def __init__(self) -> None:
         self.selected: SelectedWindow | None = None
         self.screenshot_basis: ScreenshotBasis | None = None
+        self.launched_processes: dict[int, subprocess.Popen[Any]] = {}
 
     @staticmethod
     def require_windows() -> None:
@@ -83,6 +91,29 @@ class GameController:
         self.selected = None
         self.screenshot_basis = None
         raise RuntimeError("The selected window is no longer available. Select a window again.")
+
+    @staticmethod
+    def terminate_process_tree(pid: int) -> None:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout).strip()
+            raise RuntimeError(details or f"Windows could not terminate process {pid}.")
+
+    def cleanup_launched_games(self) -> None:
+        """Stop games owned by this stdio server when its MCP connection exits."""
+        for pid, process in list(self.launched_processes.items()):
+            if process.poll() is None:
+                try:
+                    self.terminate_process_tree(pid)
+                except (OSError, subprocess.SubprocessError, RuntimeError):
+                    pass
+        self.launched_processes.clear()
 
     def focus(self, window: Any) -> None:
         if not window.isActive:
@@ -141,6 +172,61 @@ class GameController:
 
 
 controller = GameController()
+atexit.register(controller.cleanup_launched_games)
+
+
+@SERVER.tool()
+def launch_game(executable_path: str, startup_timeout_seconds: float = 60.0) -> dict[str, Any]:
+    """Start a Windows game executable and select its first window when it appears.
+
+    Provide the full path to the executable. Waits up to startup_timeout_seconds for a
+    visible, titled window belonging to the started process, then returns its window_id.
+    """
+    controller.require_windows()
+    if not 1 <= startup_timeout_seconds <= 180:
+        raise ValueError("startup_timeout_seconds must be between 1 and 180.")
+    expanded_path = os.path.expandvars(os.path.expanduser(executable_path.strip()))
+    executable = Path(expanded_path).resolve()
+    if not executable.is_file():
+        raise ValueError(f"Executable file does not exist: {executable}")
+
+    # Avoid leaving a previous game's window selected if this launch does not produce a window.
+    controller.selected = None
+    controller.screenshot_basis = None
+    process = subprocess.Popen([str(executable)], cwd=str(executable.parent))
+    controller.launched_processes[process.pid] = process
+    deadline = time.monotonic() + startup_timeout_seconds
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"The game process exited with code {process.returncode} before a window appeared."
+            )
+        for window, hwnd, pid, title in controller.windows():
+            if pid == process.pid:
+                controller.selected = SelectedWindow(hwnd, pid)
+                return {
+                    "launched": True,
+                    "process_id": pid,
+                    "window_id": f"{hwnd}:{pid}",
+                    "title": title,
+                    "executable_path": str(executable),
+                }
+        time.sleep(0.25)
+    raise TimeoutError(
+        f"The game is still running as process {process.pid}, but no titled window appeared "
+        f"within {startup_timeout_seconds:g} seconds. Use list_windows and select_window if needed."
+    )
+
+
+@SERVER.tool()
+def stop_game() -> dict[str, Any]:
+    """Terminate the currently selected app and its child processes."""
+    _, hwnd, pid, title = controller.selected_window()
+    controller.terminate_process_tree(pid)
+    controller.launched_processes.pop(pid, None)
+    controller.selected = None
+    controller.screenshot_basis = None
+    return {"stopped": True, "process_id": pid, "window_id": f"{hwnd}:{pid}", "title": title}
 
 
 def post_window_message(hwnd: int, message: int, wparam: int, lparam: int) -> None:
